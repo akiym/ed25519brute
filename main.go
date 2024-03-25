@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -11,11 +12,15 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/exec"
 	"runtime"
+	"sync"
 
 	"go.step.sm/crypto/pemutil"
 	"golang.org/x/crypto/ssh"
 )
+
+const ChildEnvName = "BRUTE_SSH_KEY_CHILD"
 
 var aKeySuffixStr = flag.String("authorized-key-suffix", "", "")
 var fingerprintPrefixStr = flag.String("fingerprint-prefix", "", "")
@@ -47,7 +52,7 @@ func generateKey(rand io.Reader, seed [ed25519.SeedSize]byte) ed25519.PrivateKey
 	return ed25519.NewKeyFromSeed(seed[:])
 }
 
-func bruteAuthorizedKey(privateKeyChan chan<- ed25519.PrivateKey) {
+func bruteAuthorizedKey() ed25519.PrivateKey {
 	rand.NewSource(rand.Int63()).Int63()
 	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
 	var seed [ed25519.SeedSize]byte
@@ -61,13 +66,12 @@ func bruteAuthorizedKey(privateKeyChan chan<- ed25519.PrivateKey) {
 		base64.StdEncoding.Encode(encodedPublicKey[:], privateKey[32-1:])
 
 		if bytes.Equal(encodedPublicKey[encodedPublicKeyLen-aKeyLen:], aKey) {
-			privateKeyChan <- privateKey
-			break
+			return privateKey
 		}
 	}
 }
 
-func bruteFingerprint(privateKeyChan chan<- ed25519.PrivateKey) {
+func bruteFingerprint() ed25519.PrivateKey {
 	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
 	var seed [ed25519.SeedSize]byte
 	var fingerprint [fingerprintLen]byte
@@ -86,13 +90,12 @@ func bruteFingerprint(privateKeyChan chan<- ed25519.PrivateKey) {
 
 		if (fingerprintPrefixLen == 0 || bytes.Equal(fingerprint[:fingerprintPrefixLen], fingerprintPrefix)) &&
 			(fingerprintSuffixLen == 0 || bytes.Equal(fingerprint[fingerprintLen-fingerprintSuffixLen:], fingerprintSuffix)) {
-			privateKeyChan <- privateKey
-			break
+			return privateKey
 		}
 	}
 }
 
-func bruteCombined(privateKeyChan chan<- ed25519.PrivateKey) {
+func bruteCombined() ed25519.PrivateKey {
 	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
 	var seed [ed25519.SeedSize]byte
 	var encodedPublicKey [encodedPublicKeyLen]byte
@@ -111,11 +114,41 @@ func bruteCombined(privateKeyChan chan<- ed25519.PrivateKey) {
 
 			if (fingerprintPrefixLen == 0 || bytes.Equal(fingerprint[:fingerprintPrefixLen], fingerprintPrefix)) &&
 				(fingerprintSuffixLen == 0 || bytes.Equal(fingerprint[fingerprintLen-fingerprintSuffixLen:], fingerprintSuffix)) {
-				privateKeyChan <- privateKey
-				break
+				return privateKey
 			}
 		}
 	}
+}
+
+func childProcess() {
+	var privateKey ed25519.PrivateKey
+	if aKeyLen > 0 && (fingerprintPrefixLen > 0 || fingerprintSuffixLen > 0) {
+		privateKey = bruteCombined()
+	} else if aKeyLen > 0 {
+		privateKey = bruteAuthorizedKey()
+	} else if fingerprintPrefixLen > 0 || fingerprintSuffixLen > 0 {
+		privateKey = bruteFingerprint()
+	}
+
+	pemBlock, _ := pemutil.SerializeOpenSSHPrivateKey(privateKey)
+	pem.Encode(os.Stdout, pemBlock)
+}
+
+func child(ctx context.Context, privateKeyChan chan<- ed25519.PrivateKey) {
+	cmd := exec.CommandContext(ctx, os.Args[0], os.Args[1:]...)
+	cmd.Env = append(os.Environ(), ChildEnvName+"=1")
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return
+	}
+
+	privateKey, err := pemutil.ParseOpenSSHPrivateKey(buf.Bytes())
+	if err != nil {
+		panic(err)
+	}
+	privateKeyChan <- privateKey.(ed25519.PrivateKey)
 }
 
 func main() {
@@ -139,20 +172,29 @@ func main() {
 		log.Fatal("the last character of fingerprint suffix must be one of \"AEIMQUYcgkosw048\"")
 	}
 
+	if os.Getenv(ChildEnvName) != "" {
+		childProcess()
+		return
+	}
+
 	log.Println("start")
 
-	privateKeyChan := make(chan ed25519.PrivateKey)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	privateKeyChan := make(chan ed25519.PrivateKey, runtime.NumCPU())
+	var wg sync.WaitGroup
 	for i := 0; i < runtime.NumCPU(); i++ {
-		if aKeyLen > 0 && (fingerprintPrefixLen > 0 || fingerprintSuffixLen > 0) {
-			go bruteCombined(privateKeyChan)
-		} else if aKeyLen > 0 {
-			go bruteAuthorizedKey(privateKeyChan)
-		} else if fingerprintPrefixLen > 0 || fingerprintSuffixLen > 0 {
-			go bruteFingerprint(privateKeyChan)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			child(ctx, privateKeyChan)
+		}()
 	}
 
 	privateKey := <-privateKeyChan
+	cancel()
+	wg.Wait()
 
 	log.Println("found")
 
