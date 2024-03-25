@@ -9,7 +9,7 @@ import (
 	"flag"
 	"io"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"runtime"
 
@@ -37,8 +37,30 @@ const (
 	fingerprintLen = 43
 )
 
-type fastRandReaderImpl struct {
+// note: I know I should use crypt/rand, it's joke software!
+type unsafeFastRandReaderImpl struct {
 	*rand.Rand
+
+	readVal uint64
+	readPos int8
+}
+
+// borrowed from math/rand implementation.
+func (r *unsafeFastRandReaderImpl) Read(p []byte) (n int, err error) {
+	pos := r.readPos
+	val := r.readVal
+	for n = 0; n < len(p); n++ {
+		if pos == 0 {
+			val = r.Uint64()
+			pos = 7
+		}
+		p[n] = byte(val)
+		val >>= 8
+		pos--
+	}
+	r.readPos = pos
+	r.readVal = val
+	return n, nil
 }
 
 // reduce allocation for seed rather than calling ed25519.GenerateKey directly.
@@ -48,12 +70,11 @@ func generateKey(rand io.Reader, seed [ed25519.SeedSize]byte) ed25519.PrivateKey
 }
 
 func bruteAuthorizedKey(privateKeyChan chan<- ed25519.PrivateKey) {
-	rand.NewSource(rand.Int63()).Int63()
-	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
+	unsafeFastRandReader := &unsafeFastRandReaderImpl{Rand: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))}
 	var seed [ed25519.SeedSize]byte
 	var encodedPublicKey [encodedPublicKeyLen]byte
 	for {
-		privateKey := generateKey(fastRandReader, seed)
+		privateKey := generateKey(unsafeFastRandReader, seed)
 
 		// the process itself is the same as the end of ssh.MarshalAuthorizedKeys.
 		// the public key is included after the private key, so encode it with a shift of 1 character to consider
@@ -68,7 +89,7 @@ func bruteAuthorizedKey(privateKeyChan chan<- ed25519.PrivateKey) {
 }
 
 func bruteFingerprint(privateKeyChan chan<- ed25519.PrivateKey) {
-	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
+	fastRandReader := &unsafeFastRandReaderImpl{Rand: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))}
 	var seed [ed25519.SeedSize]byte
 	var fingerprint [fingerprintLen]byte
 	d := sha256.New()
@@ -93,7 +114,7 @@ func bruteFingerprint(privateKeyChan chan<- ed25519.PrivateKey) {
 }
 
 func bruteCombined(privateKeyChan chan<- ed25519.PrivateKey) {
-	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
+	fastRandReader := &unsafeFastRandReaderImpl{Rand: rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))}
 	var seed [ed25519.SeedSize]byte
 	var encodedPublicKey [encodedPublicKeyLen]byte
 	var fingerprint [fingerprintLen]byte
