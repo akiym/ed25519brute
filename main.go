@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/pem"
 	"flag"
-	"io"
 	"log"
-	"math/rand"
 	"os"
 	"os/exec"
 	"runtime"
@@ -42,70 +41,48 @@ const (
 	fingerprintLen = 43
 )
 
-type fastRandReaderImpl struct {
-	*rand.Rand
-}
-
-// reduce allocation for seed rather than calling ed25519.GenerateKey directly.
-func generateKey(rand io.Reader, seed [ed25519.SeedSize]byte) ed25519.PrivateKey {
-	_, _ = io.ReadFull(rand, seed[:])
-	return ed25519.NewKeyFromSeed(seed[:])
-}
-
 func bruteAuthorizedKey() ed25519.PrivateKey {
-	rand.NewSource(rand.Int63()).Int63()
-	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
 	var seed [ed25519.SeedSize]byte
 	var encodedPublicKey [encodedPublicKeyLen]byte
 	for {
-		privateKey := generateKey(fastRandReader, seed)
+		if _, err := crand.Read(seed[:]); err != nil {
+			panic(err)
+		}
 
-		// the process itself is the same as the end of ssh.MarshalAuthorizedKeys.
-		// the public key is included after the private key, so encode it with a shift of 1 character to consider
-		// padding.
-		base64.StdEncoding.Encode(encodedPublicKey[:], privateKey[32-1:])
+		for i := 0; i < 0x10000; i++ {
+			seed[0] = byte(i)
+			seed[1] = byte(i >> 8)
+			privateKey := ed25519.NewKeyFromSeed(seed[:])
 
-		if bytes.Equal(encodedPublicKey[encodedPublicKeyLen-aKeyLen:], aKey) {
-			return privateKey
+			// the process itself is the same as the end of ssh.MarshalAuthorizedKeys.
+			// the public key is included after the private key, so encode it with a shift of 1 character to consider
+			// padding.
+			base64.StdEncoding.Encode(encodedPublicKey[:], privateKey[32-1:])
+
+			if bytes.Equal(encodedPublicKey[encodedPublicKeyLen-aKeyLen:], aKey) {
+				return privateKey
+			}
 		}
 	}
 }
 
 func bruteFingerprint() ed25519.PrivateKey {
-	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
 	var seed [ed25519.SeedSize]byte
 	var fingerprint [fingerprintLen]byte
 	d := sha256.New()
 	for {
-		privateKey := generateKey(fastRandReader, seed)
-
-		// the process itself is the same as ssh.FingerprintSHA256, but it does not use a buffer directly to avoid
-		// allocating it every time.
-		// however, allocation occurs with sha256.New().Sum(). see also: https://github.com/golang/go/issues/21948
-		d.Reset()
-		d.Write([]byte{0x00, 0x00, 0x00, 0x0b, 0x73, 0x73, 0x68, 0x2d, 0x65, 0x64, 0x32, 0x35, 0x35, 0x31, 0x39, 0x00, 0x00, 0x00, 0x20})
-		d.Write(privateKey[32:])
-		sha256sum := d.Sum(nil)
-		base64.RawStdEncoding.Encode(fingerprint[:], sha256sum[:])
-
-		if (fingerprintPrefixLen == 0 || bytes.Equal(fingerprint[:fingerprintPrefixLen], fingerprintPrefix)) &&
-			(fingerprintSuffixLen == 0 || bytes.Equal(fingerprint[fingerprintLen-fingerprintSuffixLen:], fingerprintSuffix)) {
-			return privateKey
+		if _, err := crand.Read(seed[:]); err != nil {
+			panic(err)
 		}
-	}
-}
 
-func bruteCombined() ed25519.PrivateKey {
-	fastRandReader := &fastRandReaderImpl{rand.New(rand.NewSource(rand.Int63()))}
-	var seed [ed25519.SeedSize]byte
-	var encodedPublicKey [encodedPublicKeyLen]byte
-	var fingerprint [fingerprintLen]byte
-	d := sha256.New()
-	for {
-		privateKey := generateKey(fastRandReader, seed)
-		base64.StdEncoding.Encode(encodedPublicKey[:], privateKey[32-1:])
+		for i := 0; i < 0x10000; i++ {
+			seed[0] = byte(i)
+			seed[1] = byte(i >> 8)
+			privateKey := ed25519.NewKeyFromSeed(seed[:])
 
-		if bytes.Equal(encodedPublicKey[encodedPublicKeyLen-aKeyLen:], aKey) {
+			// the process itself is the same as ssh.FingerprintSHA256, but it does not use a buffer directly to avoid
+			// allocating it every time.
+			// however, allocation occurs with sha256.New().Sum(). see also: https://github.com/golang/go/issues/21948
 			d.Reset()
 			d.Write([]byte{0x00, 0x00, 0x00, 0x0b, 0x73, 0x73, 0x68, 0x2d, 0x65, 0x64, 0x32, 0x35, 0x35, 0x31, 0x39, 0x00, 0x00, 0x00, 0x20})
 			d.Write(privateKey[32:])
@@ -115,6 +92,38 @@ func bruteCombined() ed25519.PrivateKey {
 			if (fingerprintPrefixLen == 0 || bytes.Equal(fingerprint[:fingerprintPrefixLen], fingerprintPrefix)) &&
 				(fingerprintSuffixLen == 0 || bytes.Equal(fingerprint[fingerprintLen-fingerprintSuffixLen:], fingerprintSuffix)) {
 				return privateKey
+			}
+		}
+	}
+}
+
+func bruteCombined() ed25519.PrivateKey {
+	var seed [ed25519.SeedSize]byte
+	var encodedPublicKey [encodedPublicKeyLen]byte
+	var fingerprint [fingerprintLen]byte
+	d := sha256.New()
+	for {
+		if _, err := crand.Read(seed[:]); err != nil {
+			panic(err)
+		}
+
+		for i := 0; i < 0x10000; i++ {
+			seed[0] = byte(i)
+			seed[1] = byte(i >> 8)
+			privateKey := ed25519.NewKeyFromSeed(seed[:])
+			base64.StdEncoding.Encode(encodedPublicKey[:], privateKey[32-1:])
+
+			if bytes.Equal(encodedPublicKey[encodedPublicKeyLen-aKeyLen:], aKey) {
+				d.Reset()
+				d.Write([]byte{0x00, 0x00, 0x00, 0x0b, 0x73, 0x73, 0x68, 0x2d, 0x65, 0x64, 0x32, 0x35, 0x35, 0x31, 0x39, 0x00, 0x00, 0x00, 0x20})
+				d.Write(privateKey[32:])
+				sha256sum := d.Sum(nil)
+				base64.RawStdEncoding.Encode(fingerprint[:], sha256sum[:])
+
+				if (fingerprintPrefixLen == 0 || bytes.Equal(fingerprint[:fingerprintPrefixLen], fingerprintPrefix)) &&
+					(fingerprintSuffixLen == 0 || bytes.Equal(fingerprint[fingerprintLen-fingerprintSuffixLen:], fingerprintSuffix)) {
+					return privateKey
+				}
 			}
 		}
 	}
